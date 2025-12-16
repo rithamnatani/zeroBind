@@ -1,0 +1,65 @@
+# Project: High-Performance Keybind Optimizer (DoD/SA)
+
+## 1. Architecture & Constraints
+* **Pattern:** Data-Oriented Design (SoA) via TypedArrays.
+* **Context:** WebWorker / TypeScript.
+* **Constraints:** `MAX_ACTIONS=32`, `MAX_KEYS=32`, `MAX_FINGERS=10`.
+* **Objective:** Minimize `TotalEnergy` using Simulated Annealing with Stochastic Greedy Warm Start.
+
+## 2. Memory Layout (The Hot Path)
+All structures are fixed-size to prevent GC overhead and maximize L1 cache locality.
+
+### A. State Arrays
+| Variable | Type | Description |
+| :--- | :--- | :--- |
+| `bindings` | `Uint8Array(32)` | Maps `ActionIndex` $\to$ `KeyIndex`. Init: `255` (Empty). |
+| `fingerLoads` | `Uint16Array(10)` | Accumulated effort per finger. Includes "Ghost Keys". |
+| `fingerContents` | `Int32Array(10)` | Bitmask of `ActionIndex`s currently on a finger. |
+| `occupancyMask` | `number` (Int32) | Bitmask of used `KeyIndex`s. |
+
+### B. Static Data (Read-Only)
+| Variable | Type | Value / Scaling |
+| :--- | :--- | :--- |
+| `keyEffort` | `Uint16Array(32)` | Physical cost. **Scale:** $\times 1000$ (1.5 KU $\to$ 1500). |
+| `actionFreq` | `Uint16Array(32)` | Usage rate. **Scale:** $\times 60000$ (100% $\to$ 60000). |
+| `keyToFinger` | `Uint8Array(32)` | Maps `KeyIndex` $\to$ `FingerIndex`. |
+| `hardMasks` | `Int32Array(32)` | Bitmask: Incompatible `ActionIndex`s (Hard Constraint). |
+| `softMasks` | `Int32Array(32)` | Bitmask: Awkward `ActionIndex`s (Soft Penalty). |
+| `rankedActions`| `Uint8Array(32)` | `ActionIndex`s sorted by Frequency (Desc). |
+
+## 3. Pipeline Stages
+
+### Stage 1: The Baker (Main Thread)
+* **Responsibility:** Normalization, Physics Pre-calc, Ghost Key Baking.
+* **Scalars:**
+    * `EFFORT_SCALAR = 1000`
+    * `FREQ_SCALAR = 60000`
+* **Sorting:** Generates `rankedActions` via in-place TypedArray sort (No GC).
+    ```typescript
+    const ranked = new Uint8Array(32).map((_, i) => i);
+    ranked.sort((a, b) => actionFreq[b] - actionFreq[a]);
+    ```
+
+### Stage 2: Greedy Warm Start (Worker Initialization)
+* **Strategy:** "Heaviest Item, Lowest Bin" with conflict awareness.
+* **Inputs:** `initialOccupancy`, `initialFingerLoads` (from locked "Ghost" keys).
+* **Logic:**
+    1.  Iterate `rankedActions`.
+    2.  Check Availability (`occupancyMask`).
+    3.  Check Dynamic Conflicts (`hardMasks & fingerContents`).
+    4.  Score Candidate: `Effort + (FingerLoad * FatiguePenalty) + SoftPenalty`.
+    5.  Commit Best: Update `bindings`, `occupancy`, `fingerLoads`, `fingerContents`.
+* **Output:** `WarmStartContext` (Complete state object).
+
+### Stage 3: Simulated Annealing (The Loop)
+* **State:** Initialized directly from `WarmStartContext`.
+* **Scoring:** Fixed-Point Integer Arithmetic.
+    * `TotalEnergy` (Accumulator) must be `number` (Double) to avoid Int32 overflow (~9.6B potential sum).
+* **Mutation:** Delta Scoring.
+    * `NewLoad = CurrentLoad - Cost(Old) + Cost(New)`.
+    * Implicitly preserves Ghost Key loads without tracking them separately.
+
+## 4. Key Algorithms
+
+### Greedy Assign 
+### Annealing Assign
