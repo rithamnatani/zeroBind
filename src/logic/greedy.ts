@@ -1,16 +1,6 @@
 // greedy.ts
 import { OptimizerMemory, UNBOUND } from "./optimizer-memory";
 
-// 64-bit Popcount for BigInt
-// References: "SWAR algorithm" adapted for BigInt
-function popcount64(n: bigint): number {
-  n = n - ((n >> 1n) & 0x5555555555555555n);
-  n = (n & 0x3333333333333333n) + ((n >> 2n) & 0x3333333333333333n);
-  n = (n + (n >> 4n)) & 0x0f0f0f0f0f0f0f0fn;
-  // The result fits in a Number now
-  return Number((n * 0x0101010101010101n) >> 56n);
-}
-
 export function greedyAssign(
   memory: OptimizerMemory,
   sortedActions: Uint8Array,
@@ -27,6 +17,9 @@ export function greedyAssign(
 
   // Track which actions are already handled by presets
   let assignedActionsMask = 0n; // BigInt mask
+
+  // Fix 1: Integer Counts (Local Array)
+  const fingerCounts = new Int32Array(16);
 
   // ---------------------------------------------------------
   // 2. REHYDRATE (Account for Presets)
@@ -50,6 +43,9 @@ export function greedyAssign(
 
       // 3. Add the Constraint (Bitmask)
       memory.fingerContents[finger] |= 1n << BigInt(actionId);
+
+      // 4. Increment finger count
+      fingerCounts[finger]++;
     }
   }
 
@@ -74,7 +70,8 @@ export function greedyAssign(
       memory,
       actionId,
       keyCount,
-      penaltyScratch
+      penaltyScratch,
+      fingerCounts
     );
 
     if (count === 0) continue; // Should rarely happen if keys > actions
@@ -82,7 +79,7 @@ export function greedyAssign(
     // Random Pick from top 3
     let chosenKey = k0;
     if (count > 1) {
-      const rand = fastRandom();
+      const rand = Math.random();
       if (count === 2) {
         if (rand > 0.5) chosenKey = k1;
       } else {
@@ -99,6 +96,7 @@ export function greedyAssign(
       memory.bindings[chosenKey] = actionId;
       memory.fingerLoads[finger] += memory.frequencies[actionId];
       memory.fingerContents[finger] |= 1n << BigInt(actionId);
+      fingerCounts[finger]++;
     }
   }
 }
@@ -111,7 +109,8 @@ function findBestKeys(
   memory: OptimizerMemory,
   actionId: number,
   keyCount: number,
-  fingerPenalties: Int32Array // Receive buffer
+  fingerPenalties: Int32Array,
+  fingerCounts: Int32Array
 ): [number, number, number, number] {
   let k0 = -1,
     s0 = Infinity;
@@ -123,11 +122,17 @@ function findBestKeys(
 
   const actionMask = memory.hardMasks[actionId]; // BigInt
 
-  // 1. REUSE BUFFER
+  // Fix 4: Pre-calc blocked finger mask (32-bit integer)
+  let blockedMask = 0;
   for (let f = 0; f < 16; f++) {
-    const c = popcount64(memory.fingerContents[f]);
-    // Use Math.pow to avoid 32-bit shift overflow if > 31 keys on one finger
-    fingerPenalties[f] = c > 0 ? Math.pow(2, c - 1) : 0;
+    // Fix 1 & 3: Use fingerCounts and bitwise shift for penalty
+    const c = fingerCounts[f];
+    fingerPenalties[f] = c > 0 ? 1 << (c - 1) : 0;
+
+    // Build blocked mask
+    if ((actionMask & memory.fingerContents[f]) !== 0n) {
+      blockedMask |= 1 << f;
+    }
   }
 
   for (let k = 0; k < keyCount; k++) {
@@ -138,10 +143,10 @@ function findBestKeys(
     // SAFETY: Skip invalid fingers (UNBOUND = 64)
     if (finger >= 16) continue;
 
-    if ((actionMask & memory.fingerContents[finger]) !== 0n) continue;
+    // Fix 4: Use pre-calculated blocked mask (fast integer check)
+    if ((blockedMask & (1 << finger)) !== 0) continue;
 
-    // 2. USE PRE-CALCULATED PENALTY
-    // No popcount call here anymore! Just a simple array lookup.
+    // USE PRE-CALCULATED PENALTY
     const score = memory.keyEfforts[k] + fingerPenalties[finger];
 
     if (score < s2) {
@@ -168,10 +173,4 @@ function findBestKeys(
   }
 
   return [k0, k1, k2, found];
-}
-
-let seed = Date.now();
-function fastRandom(): number {
-  seed = (seed * 1664525 + 1013904223) >>> 0;
-  return (seed >>> 0) / 0xffffffff;
 }

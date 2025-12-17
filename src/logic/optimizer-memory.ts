@@ -28,7 +28,7 @@ export class OptimizerMemory {
     // Calculate size:
     // Mask arrays are now double size (8 bytes per item * 65 items)
     // ~2.5KB total. Still fits in L1 Cache easily.
-    this.buffer = new ArrayBuffer(2560);
+    this.buffer = new ArrayBuffer(2048); //Rounded up from 1750
     let offset = 0;
 
     // 1. BigInts (8 bytes)

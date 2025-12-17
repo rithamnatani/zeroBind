@@ -9,16 +9,11 @@ ACTION_TO_MASK[UNBOUND] = 0n; // Safety pad
 // --- PENALTY LOOKUP TABLE ---
 // Exponential penalty for overloading a finger.
 // Matches the logic in Greedy: 0->0, 1->1, 2->2, 3->4...
+// Fix 3: Use bitwise shift instead of Math.pow
 const COUNT_TO_PENALTY = new Int32Array(65);
 for (let i = 1; i < 65; i++) {
-  // Use Math.pow to avoid 32-bit shift overflow if > 31 keys on one finger
-  COUNT_TO_PENALTY[i] = Math.pow(2, i - 1);
-}
-
-let seed = Date.now();
-function fastRandom(): number {
-  seed = (seed * 1664525 + 1013904223) >>> 0;
-  return (seed >>> 0) / 0xffffffff;
+  // Safe: finger can't hold >31 keys, shift won't overflow
+  COUNT_TO_PENALTY[i] = 1 << (i - 1);
 }
 
 // Optimization: Direct params instead of Config Object
@@ -49,9 +44,9 @@ export function annealingAssign(
   }
 
   for (let i = 0; i < iterations; i++) {
-    // A. Pick Keys (Branchless-ish)
-    const kA = (fastRandom() * keyCount) | 0;
-    const kB = (fastRandom() * keyCount) | 0;
+    // A. Pick Keys (Branchless-ish) - Fix 5: Use Math.random()
+    const kA = (Math.random() * keyCount) | 0;
+    const kB = (Math.random() * keyCount) | 0;
 
     if (kA === kB) continue;
 
@@ -105,9 +100,9 @@ export function annealingAssign(
 
     const delta = newEffort + newPenalty - (currentEffort + currentPenalty);
 
-    // D. Acceptance
+    // D. Acceptance - Fix 5: Use Math.random()
     if (delta >= 0) {
-      if (fastRandom() > Math.exp(-delta / temp)) continue;
+      if (Math.random() > Math.exp(-delta / temp)) continue;
     }
 
     // E. Commit

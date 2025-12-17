@@ -9,9 +9,9 @@ import { greedyAssign } from "./greedy";
 import { annealingAssign } from "./annealing";
 
 describe("OptimizerMemory", () => {
-  it("allocates exactly 2560 bytes", () => {
+  it("allocates exactly 2048 bytes", () => {
     const mem = new OptimizerMemory();
-    expect(mem.buffer.byteLength).toBe(2560);
+    expect(mem.buffer.byteLength).toBe(2048);
   });
 
   it("initializes bindings to UNBOUND", () => {
