@@ -1,113 +1,178 @@
-import { MAX_BINDS } from './protocol';
+import { OptimizerMemory, UNBOUND } from "./protocolBuffer";
+import type * as Protocol from "./protocol";
+
+// Configuration
+const LOAD_PENALTY_FACTOR = 0.5; // How much we penalize overloaded fingers vs key effort
 
 /**
- * Sorts action indices by frequency, highest first.
- * Uses selection sort to directly populate the result array.
+ * Checks if an action can be placed on a key without violating hard constraints.
+ * Returns true if the key is valid for this action.
  */
-export function sortActions(actionFreq: Uint16Array): Uint8Array {
-    // 1. Create the array ONCE (Zero allocation churn if pooled, or just fast native alloc)
-    const sorted = new Uint8Array(32);
+function checkHardConstraint(
+  actionId: number,
+  keyIndex: number,
+  finger: number,
+  keyToFingerMap: Protocol.KeyToFingerMap,
+  bindingMap: Protocol.BindingMap,
+  hardConstraintMasks: Protocol.HardConstraintMasks,
+  keyCount: number
+): boolean {
+  const actionMask = hardConstraintMasks[actionId];
 
-    // 2. Fill with 0..31
-    for (let i = 0; i < 32; i++) sorted[i] = i;
+  // Check all keys on the same finger for conflicts
+  for (let otherKey = 0; otherKey < keyCount; otherKey++) {
+    if (keyToFingerMap[otherKey] !== finger) continue;
+    if (bindingMap[otherKey] === UNBOUND) continue;
 
-    // 3. Sort In-Place
-    // V8 optimizes TypedArray.sort heavily. 
-    // It avoids some of the overhead of standard Array.sort.
-    sorted.sort((a, b) => actionFreq[b] - actionFreq[a]);
-
-    return sorted;
+    const existingAction = bindingMap[otherKey];
+    // Bitmask intersection: if bit is set, actions conflict
+    if ((actionMask & (1 << existingAction)) !== 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
-interface WarmStartContext {
-    bindings: Uint8Array;
-    fingerLoads: Uint16Array;    // The total load (Ghost + Greedy Keys)
-    fingerContents: Int32Array;  // Which actions are on which finger
-    occupancyMask: number;       // Which keys are used
+/**
+ * Calculates score for placing an action on a key.
+ * Lower score = better placement.
+ */
+function scoreKey(
+  keyIndex: number,
+  finger: number,
+  keyEffortsMKU: Protocol.KeyEffortsMKU,
+  fingerLoadsMKU: Protocol.FingerLoadsMKU
+): number {
+  const effort = keyEffortsMKU[keyIndex];
+  const currentLoad = fingerLoadsMKU[finger];
+  return effort + currentLoad * LOAD_PENALTY_FACTOR;
 }
 
-export function greedyAssignBinds(
-    actionsSorted: Uint8Array,
-    keyEffort: Uint16Array,
-    keyToFinger: Uint8Array,
-    hardMasks: Int32Array, // Assuming: Bitmask of conflicting Action IDs
-    softMasks: Int32Array, // Assuming: Bitmask of "awkward" Action IDs
-    initialOccupancyMask: number,
-    initialFingerLoads: Uint16Array
-): WarmStartContext {
-    // 1. Init with 255 to detect failures/unbound actions
-    const bindings = new Uint8Array(32).fill(255);
+/**
+ * Finds the best valid keys for an action.
+ * Returns an array of key indices, sorted by score (best first).
+ */
+function findBestKeys(
+  actionId: number,
+  keyCount: number,
+  keyToFingerMap: Protocol.KeyToFingerMap,
+  bindingMap: Protocol.BindingMap,
+  hardConstraintMasks: Protocol.HardConstraintMasks,
+  keyEffortsMKU: Protocol.KeyEffortsMKU,
+  fingerLoadsMKU: Protocol.FingerLoadsMKU,
+  maxCandidates: number
+): number[] {
+  // Track best candidates: [keyIndex, score]
+  const candidates: Array<{ key: number; score: number }> = [];
 
-    let occupancyMask = initialOccupancyMask;
+  for (let k = 0; k < keyCount; k++) {
+    // Skip occupied keys
+    if (bindingMap[k] !== UNBOUND) continue;
 
-    // Copy loads so we don't mutate the input prop
-    const fingerLoads = new Uint16Array(initialFingerLoads);
+    const finger = keyToFingerMap[k];
 
-    // Track which ACTIONS are on which FINGER (Dynamic Conflict Checking)
-    // Index = Finger ID, Value = Bitmask of Action IDs currently on that finger
-    const fingerContents = new Int32Array(16);
+    // Skip if hard constraint violated
+    if (
+      !checkHardConstraint(
+        actionId,
+        k,
+        finger,
+        keyToFingerMap,
+        bindingMap,
+        hardConstraintMasks,
+        keyCount
+      )
+    )
+      continue;
 
-    // CONFIG: Tuning weights for the greedy selection
-    const LOAD_PENALTY_MULTIPLIER = 10; // How much we hate tired fingers
-    const SOFT_CONFLICT_PENALTY = 500;  // "mKU" penalty for soft conflicts
+    const score = scoreKey(k, finger, keyEffortsMKU, fingerLoadsMKU);
 
-    for (let i = 0; i < 32; i++) {
-        const actionId = actionsSorted[i];
+    // Insert into sorted candidates list
+    if (candidates.length < maxCandidates) {
+      candidates.push({ key: k, score });
+      candidates.sort((a, b) => a.score - b.score);
+    } else if (score < candidates[maxCandidates - 1].score) {
+      candidates[maxCandidates - 1] = { key: k, score };
+      candidates.sort((a, b) => a.score - b.score);
+    }
+  }
 
-        // 2. Fix Sentinel Bug: Only break if we hit a true "Empty" marker (if you use 255 for padding)
-        // If actionsSorted is fully populated 0-31, just remove this check.
-        if (actionId === 255) break;
+  return candidates.map((c) => c.key);
+}
 
-        let bestKey = -1;
-        let bestScore = Infinity; // Lower is better
+/**
+ * Commits a binding: assigns action to key and updates finger load.
+ */
+function commitBinding(
+  actionId: number,
+  keyIndex: number,
+  actionFrequency: number,
+  bindingMap: Protocol.BindingMap,
+  fingerLoadsMKU: Protocol.FingerLoadsMKU,
+  keyToFingerMap: Protocol.KeyToFingerMap
+): void {
+  bindingMap[keyIndex] = actionId;
+  const finger = keyToFingerMap[keyIndex];
+  fingerLoadsMKU[finger] += actionFrequency;
+}
 
-        // Find best available key
-        for (let keyId = 0; keyId < 32; keyId++) {
-            const keyBit = 1 << keyId;
+/**
+ * Greedy assignment algorithm.
+ * Assigns actions to keys in priority order (most frequent first),
+ * picking from the top 3 lowest-cost available keys at random.
+ */
+export function greedyAssign(
+  memory: OptimizerMemory,
+  sortedActions: Uint8Array,
+  actionCount: number,
+  keyCount: number
+): void {
+  const {
+    keyEffortsMKU,
+    hardConstraintMasks,
+    keyToFingerMap,
+    actionFrequencies,
+    fingerLoadsMKU,
+    bindingMap,
+  } = memory;
 
-            // A. Occupancy Check (Key is taken)
-            if ((occupancyMask & keyBit) !== 0) continue;
+  const MAX_CANDIDATES = 3;
 
-            const finger = keyToFinger[keyId];
+  // Iterate actions from most frequent to least frequent
+  for (let i = 0; i < actionCount; i++) {
+    const actionId = sortedActions[i];
+    const actionFreq = actionFrequencies[actionId];
 
-            // B. Hard Conflict Check (Dynamic)
-            // Does the current action hate any action ALREADY on this finger?
-            if ((hardMasks[actionId] & fingerContents[finger]) !== 0) {
-                continue; // Impossible combination
-            }
+    // Find best valid keys for this action
+    const bestKeys = findBestKeys(
+      actionId,
+      keyCount,
+      keyToFingerMap,
+      bindingMap,
+      hardConstraintMasks,
+      keyEffortsMKU,
+      fingerLoadsMKU,
+      MAX_CANDIDATES
+    );
 
-            // C. Scoring
-            const baseEffort = keyEffort[keyId];
-
-            // Fix: Actually use the finger load!
-            const loadPenalty = fingerLoads[finger] * LOAD_PENALTY_MULTIPLIER;
-
-            // Soft Conflict: Action prefers not to share finger with existing actions
-            const conflictPenalty = ((softMasks[actionId] & fingerContents[finger]) !== 0)
-                ? SOFT_CONFLICT_PENALTY
-                : 0;
-
-            const totalScore = baseEffort + loadPenalty + conflictPenalty;
-
-            if (totalScore < bestScore) {
-                bestScore = totalScore;
-                bestKey = keyId;
-            }
-        }
-
-        if (bestKey !== -1) {
-            bindings[actionId] = bestKey;
-
-            // Update State
-            occupancyMask |= (1 << bestKey);
-            const finger = keyToFinger[bestKey];
-            fingerLoads[finger] += keyEffort[bestKey];
-            fingerContents[finger] |= (1 << actionId); // Mark this action as present on this finger
-        } else {
-            // Optional: Log failure if an action couldn't be placed
-            // console.warn(`Could not place Action ${actionId}`);
-        }
+    if (bestKeys.length === 0) {
+      console.warn(
+        `No valid key for action ${actionId}. Constraints too tight?`
+      );
+      continue;
     }
 
-    return { bindings, fingerLoads, fingerContents, occupancyMask };
+    // Pick randomly from best candidates for diversity
+    const chosenKey = bestKeys[Math.floor(Math.random() * bestKeys.length)];
+
+    // Commit the binding
+    commitBinding(
+      actionId,
+      chosenKey,
+      actionFreq,
+      bindingMap,
+      fingerLoadsMKU,
+      keyToFingerMap
+    );
+  }
 }

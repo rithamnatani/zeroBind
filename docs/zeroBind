@@ -3,7 +3,7 @@
 ## 1. Architecture & Constraints
 * **Pattern:** Data-Oriented Design (SoA) via TypedArrays.
 * **Context:** WebWorker / TypeScript.
-* **Constraints:** `MAX_ACTIONS=32`, `MAX_KEYS=32`, `MAX_FINGERS=10`.
+* **Constraints:** `MAX_BINDS=32`, `MAX_FINGERS=16`.
 * **Objective:** Minimize `TotalEnergy` using Simulated Annealing with Stochastic Greedy Warm Start.
 
 ## 2. Memory Layout (The Hot Path)
@@ -13,8 +13,8 @@ All structures are fixed-size to prevent GC overhead and maximize L1 cache local
 | Variable | Type | Description |
 | :--- | :--- | :--- |
 | `bindings` | `Uint8Array(32)` | Maps `ActionIndex` $\to$ `KeyIndex`. Init: `255` (Empty). |
-| `fingerLoads` | `Uint16Array(10)` | Accumulated effort per finger. Includes "Ghost Keys". |
-| `fingerContents` | `Int32Array(10)` | Bitmask of `ActionIndex`s currently on a finger. |
+| `fingerLoads` | `Uint16Array(16)` | Accumulated effort per finger. Includes "Ghost Keys". |
+| `fingerContents` | `Int32Array(16)` | Bitmask of `ActionIndex`s currently on a finger. |
 | `occupancyMask` | `number` (Int32) | Bitmask of used `KeyIndex`s. |
 
 ### B. Static Data (Read-Only)
