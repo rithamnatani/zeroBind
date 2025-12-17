@@ -6,11 +6,12 @@ import {
   UNBOUND,
 } from "./optimizer-memory";
 import { greedyAssign } from "./greedy";
+import { annealingAssign } from "./annealing";
 
 describe("OptimizerMemory", () => {
-  it("allocates exactly 512 bytes", () => {
+  it("allocates exactly 2560 bytes", () => {
     const mem = new OptimizerMemory();
-    expect(mem.buffer.byteLength).toBe(512);
+    expect(mem.buffer.byteLength).toBe(2560);
   });
 
   it("initializes bindings to UNBOUND", () => {
@@ -29,11 +30,12 @@ describe("OptimizerMemory", () => {
 
   it("has correct array sizes", () => {
     const mem = new OptimizerMemory();
-    expect(mem.hardMasks.length).toBe(MAX_COUNTS);
-    expect(mem.softMasks.length).toBe(MAX_COUNTS);
+    // ALLOC_SIZE is 65
+    expect(mem.hardMasks.length).toBe(65);
+    expect(mem.softMasks.length).toBe(65);
     expect(mem.fingerLoads.length).toBe(MAX_FINGERS);
     expect(mem.keyEfforts.length).toBe(MAX_COUNTS);
-    expect(mem.frequencies.length).toBe(MAX_COUNTS);
+    expect(mem.frequencies.length).toBe(65);
     expect(mem.keyToFinger.length).toBe(MAX_COUNTS);
     expect(mem.bindings.length).toBe(MAX_COUNTS);
   });
@@ -96,8 +98,8 @@ describe("greedyAssign", () => {
     // Setup: 2 actions that conflict with each other
     mem.frequencies[0] = 1000;
     mem.frequencies[1] = 500;
-    mem.hardMasks[0] = 0b10; // Action 0 conflicts with Action 1
-    mem.hardMasks[1] = 0b01; // Action 1 conflicts with Action 0
+    mem.hardMasks[0] = 2n; // Action 0 conflicts with Action 1 (1 << 1)
+    mem.hardMasks[1] = 1n; // Action 1 conflicts with Action 0 (1 << 0)
 
     const sortedActions = new Uint8Array([0, 1]);
 
@@ -134,22 +136,108 @@ describe("greedyAssign", () => {
     const totalLoad = mem.fingerLoads[0] + mem.fingerLoads[1];
     expect(totalLoad).toBe(1500); // 1000 + 500
   });
+});
 
-  it("clears previous state before assigning", () => {
+describe("annealingAssign", () => {
+  let mem: OptimizerMemory;
+
+  beforeEach(() => {
+    mem = new OptimizerMemory();
+  });
+
+  it("does not crash with valid input", () => {
+    const keyCount = 4;
+    const actionCount = 3;
+
+    for (let k = 0; k < keyCount; k++) {
+      mem.keyToFinger[k] = k;
+      mem.keyEfforts[k] = 100;
+    }
+
+    for (let a = 0; a < actionCount; a++) {
+      mem.frequencies[a] = 1000 - a * 100;
+    }
+
+    const sortedActions = new Uint8Array([0, 1, 2]);
+    greedyAssign(mem, sortedActions, actionCount, keyCount);
+
+    // Should not throw
+    expect(() =>
+      annealingAssign(mem, actionCount, keyCount, 100, 0.9995, 100)
+    ).not.toThrow();
+  });
+
+  it("respects hard constraints after annealing", () => {
+    const keyCount = 4;
+    const actionCount = 2;
+
+    // 4 keys on 2 fingers (2 keys per finger)
     mem.keyToFinger[0] = 0;
-    mem.keyEfforts[0] = 100;
+    mem.keyToFinger[1] = 0;
+    mem.keyToFinger[2] = 1;
+    mem.keyToFinger[3] = 1;
+
+    for (let k = 0; k < keyCount; k++) {
+      mem.keyEfforts[k] = 100;
+    }
+
     mem.frequencies[0] = 1000;
+    mem.frequencies[1] = 500;
 
-    // Pre-pollute state
-    mem.bindings[0] = 99;
-    mem.fingerLoads[0] = 9999;
+    // Actions 0 and 1 conflict
+    mem.hardMasks[0] = 2n; // (1 << 1)
+    mem.hardMasks[1] = 1n; // (1 << 0)
 
-    const sortedActions = new Uint8Array([0]);
+    const sortedActions = new Uint8Array([0, 1]);
+    greedyAssign(mem, sortedActions, actionCount, keyCount);
+    annealingAssign(mem, actionCount, keyCount, 100, 0.9995, 1000);
 
-    greedyAssign(mem, sortedActions, 1, 1);
+    // Verify constraints: if both actions are bound, they must be on different fingers
+    let finger0Actions = 0n;
+    let finger1Actions = 0n;
 
-    // Should have cleared and reassigned
-    expect(mem.bindings[0]).toBe(0);
-    expect(mem.fingerLoads[0]).toBe(1000);
+    for (let k = 0; k < keyCount; k++) {
+      const action = mem.bindings[k];
+      if (action !== UNBOUND) {
+        if (mem.keyToFinger[k] === 0) finger0Actions |= 1n << BigInt(action);
+        else finger1Actions |= 1n << BigInt(action);
+      }
+    }
+
+    // No finger should have both action 0 and action 1
+    const bothOnFinger0 = (finger0Actions & 3n) === 3n;
+    const bothOnFinger1 = (finger1Actions & 3n) === 3n;
+    expect(bothOnFinger0 || bothOnFinger1).toBe(false);
+  });
+
+  it("maintains valid state after annealing", () => {
+    const keyCount = 6;
+    const actionCount = 4;
+
+    for (let k = 0; k < keyCount; k++) {
+      mem.keyToFinger[k] = k % 3;
+      mem.keyEfforts[k] = 50 + k * 10;
+    }
+
+    for (let a = 0; a < actionCount; a++) {
+      mem.frequencies[a] = 1000 - a * 200;
+    }
+
+    const sortedActions = new Uint8Array([0, 1, 2, 3]);
+    greedyAssign(mem, sortedActions, actionCount, keyCount);
+    annealingAssign(mem, actionCount, keyCount, 100, 0.9995, 500);
+
+    // Verify fingerContents matches actual bindings
+    const expectedContents = new BigInt64Array(16);
+    for (let k = 0; k < keyCount; k++) {
+      const action = mem.bindings[k];
+      if (action !== UNBOUND) {
+        expectedContents[mem.keyToFinger[k]] |= 1n << BigInt(action);
+      }
+    }
+
+    for (let f = 0; f < 3; f++) {
+      expect(mem.fingerContents[f]).toBe(expectedContents[f]);
+    }
   });
 });

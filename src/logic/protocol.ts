@@ -38,6 +38,14 @@ export type KeyToFingerMap = Uint8Array;
  */
 export type KeyEffortsMKU = Uint16Array;
 
+/**
+ * The actions currently bound to each finger.
+ * Index: Finger ID
+ * Value: Bitmask of Action IDs that are currently bound to that finger.
+ * Array Size: MAX_FINGERS (Fingers).
+ */
+export type fingerContentsMKU = Int32Array;
+
 // B. Action Definitions (The Game Inputs)
 
 /**
